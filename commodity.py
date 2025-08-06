@@ -1,109 +1,130 @@
 import streamlit as st
 import pandas as pd
+import io
 import re
-from io import BytesIO
 
-def get_column_index_by_name(columns, target):
-    """Find the index of a column name, case-insensitive and trimmed."""
-    for i, col in enumerate(columns):
-        if col and isinstance(col, str) and col.strip().lower() == target.strip().lower():
-            return i
-    return None
+st.set_page_config(layout="wide", page_title="Spice Pesticide Processor")
 
-def extract_parameter_blocks(columns, start_index, end_index=None):
-    """Extract parameter blocks of 3 columns each: value, compliance, limit."""
-    param_blocks = []
-    step = 3
-    end_index = end_index or len(columns)
-    for i in range(start_index, end_index, step):
-        if i + 2 < len(columns):
-            param_name = columns[i]
-            if pd.isna(param_name) or not isinstance(param_name, str) or param_name.strip() == "":
-                continue
-            param_blocks.append((i, columns[i:i+3]))
-    return param_blocks
+st.title("🌿 Spice Pesticide Report Generator")
 
-def process_category(df, category_value, variant_value, banned_marker):
-    df_filtered = df[
-        df['Category'].astype(str).str.strip().str.lower() == category_value.strip().lower()
-    ]
-    if variant_value:
-        df_filtered = df_filtered[
-            df_filtered['Variant'].astype(str).str.strip().str.lower() == variant_value.strip().lower()
-        ]
-
-    df_filtered = df_filtered.reset_index(drop=True)
-    headers = list(df_filtered.columns)
-    banned_marker_index = get_column_index_by_name(headers, banned_marker)
-
-    if banned_marker_index is None:
-        raise ValueError(f"Could not find banned pesticide marker column: {banned_marker}")
-
-    # Off-label: all before banned_marker
-    off_label_blocks = extract_parameter_blocks(headers, start_index=headers.index(headers[0]), end_index=banned_marker_index + 1)
-    # Banned: all after banned_marker
-    banned_blocks = extract_parameter_blocks(headers, start_index=banned_marker_index + 1)
-
-    def build_df(blocks):
-        data = []
-        for idx, row in df_filtered.iterrows():
-            for col_idx, names in blocks:
-                param_name = names[0]
-                value = row.iloc[col_idx]
-                compliance = row.iloc[col_idx + 1]
-                limit = row.iloc[col_idx + 2]
-                data.append({
-                    "Sample ID": row.get("Sample ID", idx + 1),
-                    "Pesticide": param_name,
-                    "Value": value,
-                    "Compliance": compliance,
-                    "Limit": limit
-                })
-        return pd.DataFrame(data)
-
-    return build_df(off_label_blocks), build_df(banned_blocks)
-
-def generate_excel(organic_off, organic_ban, loose_off, loose_ban):
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        organic_off.to_excel(writer, sheet_name="Organic_Off_Label", index=False)
-        organic_ban.to_excel(writer, sheet_name="Organic_Banned", index=False)
-        loose_off.to_excel(writer, sheet_name="Loose_Off_Label", index=False)
-        loose_ban.to_excel(writer, sheet_name="Loose_Banned", index=False)
-    output.seek(0)
-    return output
-
-# === Streamlit UI ===
-st.title("🧪 Pesticide Parameter Extractor")
-
-uploaded_file = st.file_uploader("Upload Excel File with Sheets for Each Commodity", type=["xlsx"])
+uploaded_file = st.file_uploader("Upload Excel file with 13 spice sheets", type=["xlsx"])
 
 if uploaded_file:
     xls = pd.ExcelFile(uploaded_file)
-    sheet = st.selectbox("Select Commodity Sheet", xls.sheet_names)
-    df = pd.read_excel(xls, sheet_name=sheet)
+    sheet_names = xls.sheet_names
+    st.success(f"✅ Found {len(sheet_names)} sheets: {', '.join(sheet_names)}")
 
-    category_col = st.selectbox("Select Category Column", df.columns)
-    variant_col = st.selectbox("Select Variant Column", df.columns)
-    unique_categories = df[category_col].dropna().unique()
-    category = st.selectbox("Select Category", unique_categories)
+    selected_sheet = st.selectbox("📋 Select a Spice Sheet to Process", sheet_names)
+    df = xls.parse(selected_sheet)
+    df.columns = [str(col).strip() for col in df.columns]  # Normalize column names
 
-    unique_variants = df[variant_col].dropna().unique()
-    variant = st.selectbox("Select Variant (Optional)", [""] + list(unique_variants))
+    st.dataframe(df.head(5))
 
-    marker_input = st.text_input("Enter Banned Pesticide Marker Column", value="Monitoring_banned_pesticide_Starts")
+    with st.expander("🔧 Column Settings"):
+        col_names = df.columns.tolist()
 
-    if st.button("Process and Download Excel"):
-        df = df.rename(columns=lambda x: str(x).strip())  # normalize headers
-        df = df.rename(columns={category_col: "Category", variant_col: "Variant"})  # map to expected keys
+        commodity_col = st.selectbox("Select 'Commodity' column", col_names)
+        variant_col = st.selectbox("Select 'Variant' column", col_names)
 
-        try:
-            organic_off, organic_ban = process_category(df, category, variant, marker_input)
-            loose_off, loose_ban = process_category(df, category, variant, marker_input)
-            excel_bytes = generate_excel(organic_off, organic_ban, loose_off, loose_ban)
+        # Auto-detect banned marker column case-insensitively
+        banned_marker = next((col for col in col_names if str(col).strip().lower() == "monitoring_banned_pesticide_starts"), None)
 
-            st.success("✅ Excel generated successfully!")
-            st.download_button("📥 Download Excel File", data=excel_bytes, file_name=f"{category}_{variant}_Pesticide_Report.xlsx")
+        if banned_marker is None:
+            banned_marker = st.selectbox("Select the 'Monitoring_banned_pesticide_Starts' marker column", col_names)
+        else:
+            st.info(f"Auto-detected banned pesticide marker column: **{banned_marker}**")
 
-        except Exception as e:
-            st.error(f"Error: {e}")
+        marker_index = df.columns.get_loc(banned_marker)
+
+        # Find first non-empty column after marker for actual banned start
+        banned_start = marker_index + 1
+        while banned_start < len(df.columns) and df.iloc[:, banned_start].isnull().all():
+            banned_start += 1
+
+        offlabel_start = df.columns.get_loc(df.columns[commodity_col]) + 3  # You can tweak this if needed
+        offlabel_end = marker_index - 1
+        banned_end = len(df.columns) - 1
+
+    def get_parameter_indexes(start_col, end_col):
+        columns = df.columns[start_col:end_col + 1]
+        # Every parameter takes 3 columns: value, compliance, limit
+        param_triplets = [i for i in range(start_col, end_col + 1, 3) if i + 1 <= end_col]
+        return param_triplets
+
+    def process_data(variant_filter, start_col, end_col, type_name):
+        result_rows = []
+        param_indexes = get_parameter_indexes(start_col, end_col)
+
+        pesticide_data = {}
+        for _, row in df.iterrows():
+            commodity = row[commodity_col]
+            variant = row[variant_col]
+
+            if isinstance(variant_filter, list):
+                if variant not in variant_filter:
+                    continue
+            else:
+                if variant != variant_filter:
+                    continue
+
+            for i in param_indexes:
+                pest = df.columns[i]
+                value = row[i]
+                compliance = str(row[i + 1]).strip().lower() if i + 1 < len(df.columns) else ""
+
+                if pd.notna(value) and value != "":
+                    try:
+                        value = float(str(value).strip())
+                    except (ValueError, TypeError):
+                        continue
+
+                    if pest not in pesticide_data:
+                        pesticide_data[pest] = {}
+                    if commodity not in pesticide_data[pest]:
+                        pesticide_data[pest][commodity] = {
+                            "min": None, "max": None, "total": 0, "unsafe": 0
+                        }
+
+                    rec = pesticide_data[pest][commodity]
+                    rec["total"] += 1
+                    if compliance == "unsafe":
+                        rec["unsafe"] += 1
+                        if rec["min"] is None or value < rec["min"]:
+                            rec["min"] = value
+                        if rec["max"] is None or value > rec["max"]:
+                            rec["max"] = value
+
+        results = [["S. No", type_name + " Pesticide Residues", "Name of Spice",
+                    "Min Amount (mg/kg)", "Max Amount (mg/kg)",
+                    "No. of unsafe", "Total Samples", "% Unsafe"]]
+
+        sn = 1
+        for pest, commodities in pesticide_data.items():
+            for commodity, rec in commodities.items():
+                percent = (rec["unsafe"] / rec["total"] * 100) if rec["total"] > 0 else 0
+                results.append([
+                    sn, pest, commodity,
+                    rec["min"] if rec["min"] is not None else "No Residue",
+                    rec["max"] if rec["max"] is not None else "No Residue",
+                    rec["unsafe"], rec["total"], f"{percent:.2f}%"])
+                sn += 1
+
+        return pd.DataFrame(results[1:], columns=results[0])
+
+    st.write("### 📊 Generate Report for Selected Commodity")
+
+    if st.button("Generate Report"):
+        organic_off = process_data("Organic", offlabel_start, offlabel_end, "Off-label Organic")
+        organic_ban = process_data("Organic", banned_start, banned_end, "Banned Organic")
+        normal_off = process_data(["Normal", "Loose"], offlabel_start, offlabel_end, "Off-label")
+        normal_ban = process_data(["Normal", "Loose"], banned_start, banned_end, "Banned")
+
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            organic_off.to_excel(writer, sheet_name="Organic Off-label", index=False)
+            organic_ban.to_excel(writer, sheet_name="Organic Banned", index=False)
+            normal_off.to_excel(writer, sheet_name="Loose Off-label", index=False)
+            normal_ban.to_excel(writer, sheet_name="Loose Banned", index=False)
+
+        st.success("✅ Report Generated Successfully!")
+        st.download_button("📥 Download Final Report", output.getvalue(), "processed_spice_report.xlsx")
