@@ -3,86 +3,101 @@ import pandas as pd
 import re
 from io import BytesIO
 
+st.set_page_config(page_title="Pesticide Data Processor", layout="wide")
+st.title("🌿 Pesticide Parameter Processor")
+st.markdown("Process Organic and Loose/Normal pesticide data from commodity files.")
+
 def normalize_column(col):
     return re.sub(r"[^a-z]", "", str(col).lower())
 
 def get_marker_index(df, marker):
-    for i, col in enumerate(df.columns):
+    for idx, col in enumerate(df.columns):
         if normalize_column(col) == normalize_column(marker):
-            return i + 1  # Start from next column
+            return idx + 1  # data starts from next column
+    return None
+
+def find_column_by_name(df, search_name):
+    normalized_search = normalize_column(search_name)
+    for col in df.columns:
+        if normalize_column(col) == normalized_search:
+            return col
     return None
 
 def extract_parameters(df, start_index):
-    param_cols = df.columns[start_index:]
-    num_params = len(param_cols) // 3
     param_data = []
+    columns = df.columns[start_index:]
+    for i in range(0, len(columns), 3):
+        if i + 2 >= len(columns):
+            break
+        param_name = columns[i]
+        param_value_col = columns[i]
+        compliance_col = columns[i + 1]
+        limit_col = columns[i + 2]
 
-    for i in range(num_params):
-        value_col = param_cols[i*3]
-        compliance_col = param_cols[i*3 + 1]
-        limit_col = param_cols[i*3 + 2]
+        temp_df = df[[param_value_col, compliance_col, limit_col]].copy()
+        temp_df.columns = ["Value", "Compliance", "Limit"]
+        temp_df.insert(0, "Parameter", param_name)
 
-        param_name = re.sub(r"_value$|_compliance$|_limit$", "", str(value_col), flags=re.IGNORECASE)
+        for col in ["Sample ID", "Sample Category", "Commodity", "Sample Type"]:
+            col_match = find_column_by_name(df, col)
+            if col_match:
+                temp_df[col] = df[col_match]
 
-        subset = df[["Sample ID", value_col, compliance_col, limit_col]].copy()
-        subset.columns = ["Sample ID", "Value", "Compliance", "Limit"]
-        subset["Parameter"] = param_name
-        param_data.append(subset)
+        param_data.append(temp_df)
 
-    return pd.concat(param_data, ignore_index=True)
+    return pd.concat(param_data, ignore_index=True) if param_data else pd.DataFrame()
 
-def filter_category(df, category):
-    return df[df["Sample Category"].str.contains(category, case=False, na=False)]
+def filter_category(df, category, category_col):
+    if category_col is None:
+        st.error("❌ 'Sample Category' column not found.")
+        return pd.DataFrame()
+    return df[df[category_col].astype(str).str.contains(category, case=False, na=False)]
 
-def process_block(df, category, start_col, label):
-    category_df = filter_category(df, category)
-    if start_col is None:
-        st.warning(f"Start marker not found for {label}. Skipping...")
+def process_block(df, category, start_col, label, category_col):
+    category_df = filter_category(df, category, category_col)
+    if start_col is None or category_df.empty:
+        st.warning(f"⚠️ Skipping block for: {label}")
         return pd.DataFrame()
     return extract_parameters(category_df, start_col)
 
 def process_sheet(df):
     offlabel_start = get_marker_index(df, "Monitoring_off_label_pesticide_Starts")
     banned_start = get_marker_index(df, "Monitoring_banned_pesticide_Starts")
+    category_col = find_column_by_name(df, "Sample Category")
 
     return {
-        "Organic - Off-label": process_block(df, "Organic", offlabel_start, "Off-label Organic"),
-        "Organic - Banned": process_block(df, "Organic", banned_start, "Banned Organic"),
-        "Loose - Off-label": process_block(df, "Normal|Loose", offlabel_start, "Off-label Loose/Normal"),
-        "Loose - Banned": process_block(df, "Normal|Loose", banned_start, "Banned Loose/Normal"),
+        "Organic - Off-label": process_block(df, "Organic", offlabel_start, "Off-label Organic", category_col),
+        "Organic - Banned": process_block(df, "Organic", banned_start, "Banned Organic", category_col),
+        "Loose - Off-label": process_block(df, "Normal|Loose", offlabel_start, "Off-label Loose/Normal", category_col),
+        "Loose - Banned": process_block(df, "Normal|Loose", banned_start, "Banned Loose/Normal", category_col),
     }
 
-def to_excel(output_dict):
+def to_excel_sheets(sheet_dict):
     output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        for sheet_name, df in output_dict.items():
-            safe_name = sheet_name[:31]
-            df.to_excel(writer, index=False, sheet_name=safe_name)
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        for sheet_name, df in sheet_dict.items():
+            clean_name = sheet_name[:31]  # Excel max length for sheet name
+            df.to_excel(writer, sheet_name=clean_name, index=False)
     output.seek(0)
     return output
 
-# Streamlit UI
-st.title("🧪 Pesticide Parameter Processor")
-
-uploaded_file = st.file_uploader("Upload Excel File with All Commodities", type=["xlsx"])
+uploaded_file = st.file_uploader("📤 Upload a single commodity Excel file", type=["xlsx"])
 
 if uploaded_file:
-    xls = pd.ExcelFile(uploaded_file)
-    st.success("Excel file uploaded.")
+    sheet_names = pd.ExcelFile(uploaded_file).sheet_names
+    selected_sheet = st.selectbox("🧾 Select sheet (commodity)", sheet_names)
 
-    sheet_name = st.selectbox("Select a commodity (sheet):", xls.sheet_names)
+    if selected_sheet:
+        df = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
+        st.success(f"✅ Loaded sheet: {selected_sheet} with shape {df.shape}")
 
-    if st.button("Process Selected Sheet"):
-        df = xls.parse(sheet_name)
         output_dict = process_sheet(df)
 
-        st.success("✅ Processing complete!")
-
-        output_excel = to_excel(output_dict)
-
+        st.markdown("### 📥 Download Output")
+        excel_bytes = to_excel_sheets(output_dict)
         st.download_button(
-            label="📥 Download Processed Excel",
-            data=output_excel,
-            file_name=f"Processed_{sheet_name}.xlsx",
+            label="📩 Download Processed Excel",
+            data=excel_bytes,
+            file_name=f"Processed_{selected_sheet}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
