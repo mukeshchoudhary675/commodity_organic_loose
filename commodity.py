@@ -1,63 +1,88 @@
+import streamlit as st
 import pandas as pd
+import re
+from io import BytesIO
 
-def find_column_index(columns, marker):
-    marker = marker.strip().lower()
-    for i, col in enumerate(columns):
-        if col and col.strip().lower() == marker:
-            return i
-    return -1
+def normalize_column(col):
+    return re.sub(r"[^a-z]", "", str(col).lower())
 
-def extract_parameter_blocks(df, start_col_idx):
-    # Extract all columns after start_col_idx in blocks of 3 (value, compliance, limit)
-    columns = df.columns[start_col_idx + 1:]
-    total_cols = len(columns)
-    param_blocks = []
+def get_marker_index(df, marker):
+    for i, col in enumerate(df.columns):
+        if normalize_column(col) == normalize_column(marker):
+            return i + 1  # Start from next column
+    return None
 
-    for i in range(0, total_cols, 3):
-        block = columns[i:i+3]
-        if len(block) == 3:
-            param_blocks.append(block)
+def extract_parameters(df, start_index):
+    param_cols = df.columns[start_index:]
+    num_params = len(param_cols) // 3
+    param_data = []
 
-    return param_blocks
+    for i in range(num_params):
+        value_col = param_cols[i*3]
+        compliance_col = param_cols[i*3 + 1]
+        limit_col = param_cols[i*3 + 2]
 
-def filter_by_category(df, category):
-    return df[df["Category"].str.lower().isin([c.lower() for c in category])]
+        param_name = re.sub(r"_value$|_compliance$|_limit$", "", str(value_col), flags=re.IGNORECASE)
 
-def build_dataset(df, param_blocks, category):
-    filtered_df = filter_by_category(df, category)
-    selected_cols = []
+        subset = df[["Sample ID", value_col, compliance_col, limit_col]].copy()
+        subset.columns = ["Sample ID", "Value", "Compliance", "Limit"]
+        subset["Parameter"] = param_name
+        param_data.append(subset)
 
-    for block in param_blocks:
-        selected_cols.extend(block)
+    return pd.concat(param_data, ignore_index=True)
 
-    meta_cols = [col for col in df.columns if col not in selected_cols]
-    result = filtered_df[meta_cols + selected_cols]
-    return result
+def filter_category(df, category):
+    return df[df["Sample Category"].str.contains(category, case=False, na=False)]
 
-def process_sheet(df, banned_marker, offlabel_marker):
-    # Normalize columns
-    df.columns = [str(col).strip() for col in df.columns]
+def process_block(df, category, start_col, label):
+    category_df = filter_category(df, category)
+    if start_col is None:
+        st.warning(f"Start marker not found for {label}. Skipping...")
+        return pd.DataFrame()
+    return extract_parameters(category_df, start_col)
 
-    # --- Banned Pesticides ---
-    banned_start = find_column_index(df.columns, banned_marker)
-    banned_params = extract_parameter_blocks(df, banned_start)
+def process_sheet(df):
+    offlabel_start = get_marker_index(df, "Monitoring_off_label_pesticide_Starts")
+    banned_start = get_marker_index(df, "Monitoring_banned_pesticide_Starts")
 
-    # --- Off-label Pesticides ---
-    offlabel_start = find_column_index(df.columns, offlabel_marker)
-    offlabel_params = extract_parameter_blocks(df, offlabel_start)
-
-    # Process datasets
-    data = {
-        "Organic - Off-label": build_dataset(df, offlabel_params, ["Organic"]),
-        "Organic - Banned": build_dataset(df, banned_params, ["Organic"]),
-        "Loose - Off-label": build_dataset(df, offlabel_params, ["Loose", "Normal"]),
-        "Loose - Banned": build_dataset(df, banned_params, ["Loose", "Normal"])
+    return {
+        "Organic - Off-label": process_block(df, "Organic", offlabel_start, "Off-label Organic"),
+        "Organic - Banned": process_block(df, "Organic", banned_start, "Banned Organic"),
+        "Loose - Off-label": process_block(df, "Normal|Loose", offlabel_start, "Off-label Loose/Normal"),
+        "Loose - Banned": process_block(df, "Normal|Loose", banned_start, "Banned Loose/Normal"),
     }
 
-    return data
+def to_excel(output_dict):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        for sheet_name, df in output_dict.items():
+            safe_name = sheet_name[:31]
+            df.to_excel(writer, index=False, sheet_name=safe_name)
+    output.seek(0)
+    return output
 
-def save_output(data, commodity_name, output_path):
-    with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
-        for sheet_name, df in data.items():
-            safe_sheet_name = f"{sheet_name} {commodity_name}"[:31]
-            df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
+# Streamlit UI
+st.title("🧪 Pesticide Parameter Processor")
+
+uploaded_file = st.file_uploader("Upload Excel File with All Commodities", type=["xlsx"])
+
+if uploaded_file:
+    xls = pd.ExcelFile(uploaded_file)
+    st.success("Excel file uploaded.")
+
+    sheet_name = st.selectbox("Select a commodity (sheet):", xls.sheet_names)
+
+    if st.button("Process Selected Sheet"):
+        df = xls.parse(sheet_name)
+        output_dict = process_sheet(df)
+
+        st.success("✅ Processing complete!")
+
+        output_excel = to_excel(output_dict)
+
+        st.download_button(
+            label="📥 Download Processed Excel",
+            data=output_excel,
+            file_name=f"Processed_{sheet_name}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
